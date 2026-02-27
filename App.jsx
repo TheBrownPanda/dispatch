@@ -20,6 +20,8 @@ const KNOWN_COORDS = {
   "1325 j st":{lat:38.5780,lng:-121.4880},"2035 hurley":{lat:38.5850,lng:-121.4200},
   "1600 exposition":{lat:38.5760,lng:-121.4270},"2700 stockton":{lat:38.5590,lng:-121.4530},
 };
+const COMPLEXITY_OPTS = ["small","medium","large","large-event","vip","boxed","bar-event"];
+const PICKUP_TYPES = ["none","same-day","next-day","server-cleanup"];
 
 /* ═══════════════════════════ UTILITIES ═══════════════════════════ */
 function tm(t){const[h,m]=t.split(":").map(Number);return h*60+m}
@@ -54,314 +56,295 @@ function autoAssign(orders,drivers,dc){if(!orders.length)return{};const sorted=[
 function buildSched(orders,asgn,drivers,dc){const s={};drivers.forEach(d=>{s[d.id]=[]});const g={};drivers.forEach(d=>{g[d.id]=[]});orders.forEach(o=>{const did=asgn[o.id];if(did&&g[did])g[did].push(o)});Object.keys(g).forEach(did=>{const ords=g[did].sort((a,b)=>tm(a.deliveryTime)-tm(b.deliveryTime));let cur={lat:HQ.lat,lng:HQ.lng},t=tm(drivers.find(d=>d.id===did).available);ords.forEach(o=>{const ld=loadMin(o.complexity),dr=gCD(dc,cur,o),dl=tm(o.deliveryTime);const ls=Math.max(t,dl-dr-ld-10),dep=ls+ld,arr=dep+dr;s[did].push({type:"load",orderId:o.id,start:ls,duration:ld,label:`Load ${o.company}`,detail:`${o.guests}p`});s[did].push({type:"drive",orderId:o.id,start:dep,duration:dr,label:`→ ${o.company}`,detail:`${dr}min`});s[did].push({type:"setup",orderId:o.id,start:arr,duration:o.setupMinutes,label:`Setup: ${o.event}`,detail:`${o.guests}p`});t=arr+o.setupMinutes;cur={lat:o.lat,lng:o.lng}});if(ords.length){const ret=gCD(dc,cur,HQ);s[did].push({type:"return",start:t,duration:ret,label:"→ HQ",detail:`${ret}min`})}});return s}
 
 /* ═══════════════════════════ LEAFLET MAP ═══════════════════════════ */
-async function loadLeaflet() {
-  if (window.L) return window.L;
-  return new Promise((resolve, reject) => {
-    const css = document.createElement("link");
-    css.rel = "stylesheet";
-    css.href = "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css";
-    document.head.appendChild(css);
-    const js = document.createElement("script");
-    js.src = "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js";
-    js.onload = () => resolve(window.L);
-    js.onerror = reject;
-    document.head.appendChild(js);
-  });
-}
+async function loadLeaflet(){if(window.L)return window.L;return new Promise((res,rej)=>{const css=document.createElement("link");css.rel="stylesheet";css.href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css";document.head.appendChild(css);const js=document.createElement("script");js.src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js";js.onload=()=>res(window.L);js.onerror=rej;document.head.appendChild(js)})}
+async function fetchOSRM(wps){if(wps.length<2)return null;const coords=wps.map(w=>`${w.lng},${w.lat}`).join(";");try{const r=await fetch(`https://router.project-osrm.org/route/v1/driving/${coords}?overview=full&geometries=geojson`);const d=await r.json();if(d.code==="Ok"&&d.routes?.[0]?.geometry?.coordinates)return d.routes[0].geometry.coordinates.map(([lng,lat])=>[lat,lng])}catch(e){console.warn("OSRM fail:",e)}return null}
 
-async function fetchOSRMRoute(waypoints) {
-  if (waypoints.length < 2) return null;
-  const coords = waypoints.map(w => `${w.lng},${w.lat}`).join(";");
-  try {
-    const r = await fetch(`https://router.project-osrm.org/route/v1/driving/${coords}?overview=full&geometries=geojson`);
-    const d = await r.json();
-    if (d.code === "Ok" && d.routes?.[0]?.geometry?.coordinates) {
-      return d.routes[0].geometry.coordinates.map(([lng, lat]) => [lat, lng]);
-    }
-  } catch (e) { console.warn("OSRM route fetch failed:", e); }
-  return null;
-}
-
-function MapView({ orders, assignments, drivers, pickupRuns, driveCache }) {
+function MapView({ orders, assignments, drivers, pickupRuns, driveCache, schedule }) {
   const mapRef = useRef(null);
-  const mapInstance = useRef(null);
-  const layersRef = useRef({ delivery: [], pickup: [], markers: [] });
+  const mapInst = useRef(null);
+  const layers = useRef({ lines: [], markers: [] });
   const [mode, setMode] = useState("delivery");
   const [loading, setLoading] = useState(true);
-  const [selectedDriver, setSelectedDriver] = useState("all");
+  const [selDriver, setSelDriver] = useState("all");
+  const [routePanel, setRoutePanel] = useState(null); // { driverId, stops } or { runIndex, stops }
 
-  // Build delivery routes per driver
   const deliveryRoutes = useMemo(() => {
-    const routes = {};
-    drivers.forEach(d => { routes[d.id] = []; });
-    orders.forEach(o => { const did = assignments[o.id]; if (did && routes[did]) routes[did].push(o); });
-    Object.keys(routes).forEach(did => {
-      routes[did].sort((a, b) => tm(a.deliveryTime) - tm(b.deliveryTime));
-    });
-    return routes;
+    const r = {};
+    drivers.forEach(d => { r[d.id] = []; });
+    orders.forEach(o => { const did = assignments[o.id]; if (did && r[did]) r[did].push(o); });
+    Object.keys(r).forEach(did => r[did].sort((a, b) => tm(a.deliveryTime) - tm(b.deliveryTime)));
+    return r;
   }, [orders, assignments, drivers]);
 
   useEffect(() => {
-    let cancelled = false;
+    let dead = false;
     (async () => {
       const L = await loadLeaflet();
-      if (cancelled || !mapRef.current) return;
-      if (mapInstance.current) { mapInstance.current.remove(); mapInstance.current = null; }
-
-      const map = L.map(mapRef.current, { zoomControl: true, attributionControl: true }).setView([HQ.lat, HQ.lng], 11);
-      mapInstance.current = map;
-
+      if (dead || !mapRef.current) return;
+      if (mapInst.current) { mapInst.current.remove(); mapInst.current = null; }
+      const map = L.map(mapRef.current, { zoomControl: true }).setView([HQ.lat, HQ.lng], 11);
+      mapInst.current = map;
       L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
-        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>',
-        maxZoom: 19,
+        attribution: '&copy; OSM &copy; CARTO', maxZoom: 19,
       }).addTo(map);
-
-      // HQ marker
       const hqIcon = L.divIcon({
-        html: `<div style="width:28px;height:28px;background:#f59e0b;border:3px solid #fff;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:14px;color:#000;box-shadow:0 2px 8px rgba(0,0,0,.5)">H</div>`,
-        className: "", iconSize: [28, 28], iconAnchor: [14, 14],
+        html: `<div style="width:30px;height:30px;background:#f59e0b;border:3px solid #fff;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:15px;color:#000;box-shadow:0 2px 10px rgba(0,0,0,.5)">H</div>`,
+        className: "", iconSize: [30, 30], iconAnchor: [15, 15],
       });
-      L.marker([HQ.lat, HQ.lng], { icon: hqIcon })
-        .bindPopup(`<b>Hannibal's Catering HQ</b><br/>Sacramento, CA`)
-        .addTo(map);
-
+      L.marker([HQ.lat, HQ.lng], { icon: hqIcon }).bindPopup("<b>Hannibal's HQ</b>").addTo(map);
       setLoading(false);
     })();
-    return () => { cancelled = true; if (mapInstance.current) { mapInstance.current.remove(); mapInstance.current = null; } };
+    return () => { dead = true; if (mapInst.current) { mapInst.current.remove(); mapInst.current = null; } };
   }, []);
 
-  // Draw routes when mode/filter changes
+  // Draw routes
   useEffect(() => {
-    if (!mapInstance.current || loading) return;
-    const L = window.L;
-    const map = mapInstance.current;
+    if (!mapInst.current || loading) return;
+    const L = window.L, map = mapInst.current;
+    layers.current.lines.forEach(l => map.removeLayer(l));
+    layers.current.markers.forEach(l => map.removeLayer(l));
+    layers.current = { lines: [], markers: [] };
 
-    // Clear old layers
-    layersRef.current.delivery.forEach(l => map.removeLayer(l));
-    layersRef.current.pickup.forEach(l => map.removeLayer(l));
-    layersRef.current.markers.forEach(l => map.removeLayer(l));
-    layersRef.current = { delivery: [], pickup: [], markers: [] };
-
-    const addMarker = (lat, lng, color, label, popup, size = 20) => {
+    const mkr = (lat, lng, color, label, popupHtml, sz = 22) => {
       const icon = L.divIcon({
-        html: `<div style="width:${size}px;height:${size}px;background:${color};border:2px solid rgba(255,255,255,.8);border-radius:50%;box-shadow:0 2px 6px rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;font-size:8px;font-weight:700;color:#fff">${label}</div>`,
-        className: "", iconSize: [size, size], iconAnchor: [size/2, size/2],
+        html: `<div style="width:${sz}px;height:${sz}px;background:${color};border:2px solid rgba(255,255,255,.85);border-radius:50%;box-shadow:0 2px 8px rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;color:#fff">${label}</div>`,
+        className: "", iconSize: [sz, sz], iconAnchor: [sz/2, sz/2],
       });
-      const m = L.marker([lat, lng], { icon }).bindPopup(popup).addTo(map);
-      layersRef.current.markers.push(m);
-      return m;
+      const m = L.marker([lat, lng], { icon }).addTo(map);
+      if (popupHtml) m.bindPopup(popupHtml, { maxWidth: 280 });
+      layers.current.markers.push(m);
     };
 
     if (mode === "delivery") {
-      const driverIds = selectedDriver === "all" ? drivers.map(d => d.id) : [selectedDriver];
-      const allPoints = [[HQ.lat, HQ.lng]];
-
-      driverIds.forEach(did => {
-        const dr = drivers.find(d => d.id === did);
-        if (!dr) return;
-        const ords = deliveryRoutes[did] || [];
-        if (!ords.length) return;
-
-        const waypoints = [HQ, ...ords];
-        const latlngs = waypoints.map(w => [w.lat, w.lng]);
-        allPoints.push(...latlngs);
-
-        // Draw straight-line route immediately
-        const line = L.polyline(latlngs, {
-          color: dr.color, weight: 3, opacity: 0.4, dashArray: "8,6",
-        }).addTo(map);
-        layersRef.current.delivery.push(line);
-
-        // Fetch real road route from OSRM
-        fetchOSRMRoute(waypoints).then(routeCoords => {
-          if (!routeCoords || !mapInstance.current) return;
-          map.removeLayer(line);
-          const idx = layersRef.current.delivery.indexOf(line);
-          if (idx > -1) layersRef.current.delivery.splice(idx, 1);
-          const roadLine = L.polyline(routeCoords, {
-            color: dr.color, weight: 4, opacity: 0.8,
-          }).addTo(map);
-          layersRef.current.delivery.push(roadLine);
-
-          // Animated direction arrow
-          const arrowLine = L.polyline(routeCoords, {
-            color: dr.color, weight: 2, opacity: 0.3, dashArray: "4,12", className: "animated-dash",
-          }).addTo(map);
-          layersRef.current.delivery.push(arrowLine);
+      const dids = selDriver === "all" ? drivers.map(d => d.id) : [selDriver];
+      const pts = [[HQ.lat, HQ.lng]];
+      dids.forEach(did => {
+        const dr = drivers.find(d => d.id === did); if (!dr) return;
+        const ords = deliveryRoutes[did] || []; if (!ords.length) return;
+        const wps = [HQ, ...ords];
+        const ll = wps.map(w => [w.lat, w.lng]);
+        pts.push(...ll);
+        // Dashed line first
+        const dash = L.polyline(ll, { color: dr.color, weight: 3, opacity: 0.35, dashArray: "8,6" }).addTo(map);
+        layers.current.lines.push(dash);
+        // Click the line to open route panel
+        dash.on("click", () => {
+          setRoutePanel({ type: "delivery", driverId: did, driverName: dr.name, driverColor: dr.color, stops: ords });
         });
-
-        // Delivery markers
+        // Real road
+        fetchOSRM(wps).then(rc => {
+          if (!rc || !mapInst.current) return;
+          map.removeLayer(dash);
+          const i = layers.current.lines.indexOf(dash); if (i > -1) layers.current.lines.splice(i, 1);
+          const road = L.polyline(rc, { color: dr.color, weight: 4, opacity: 0.85 }).addTo(map);
+          road.on("click", () => {
+            setRoutePanel({ type: "delivery", driverId: did, driverName: dr.name, driverColor: dr.color, stops: ords });
+          });
+          layers.current.lines.push(road);
+        });
+        // Markers
         ords.forEach((o, i) => {
-          const driveTime = gCD(driveCache, i === 0 ? HQ : ords[i - 1], o);
-          addMarker(o.lat, o.lng, dr.color, i + 1,
-            `<div style="font-family:sans-serif;font-size:12px">
-              <b style="font-size:14px">${o.company}</b><br/>
-              <span style="color:#666">${o.event}</span><br/><br/>
-              🕐 Deliver: <b>${fmtShort(tm(o.deliveryTime))}</b> · Serve: ${fmtShort(tm(o.servingTime))}<br/>
-              👥 ${o.guests} guests · ${o.setupMinutes}min setup<br/>
-              🚐 ~${driveTime}min drive from ${i === 0 ? "HQ" : "prev stop"}<br/>
-              📍 ${o.address}<br/>
-              📋 ${o.room || "—"}<br/>
-              👤 ${o.contact} ${o.phone}<br/>
-              <br/><b>Driver: ${dr.name}</b> (Stop #${i + 1})
-            </div>`,
-            22
+          const drv = gCD(driveCache, i === 0 ? HQ : ords[i - 1], o);
+          mkr(o.lat, o.lng, dr.color, i + 1,
+            `<div style="font-family:'DM Sans',sans-serif;font-size:12px;line-height:1.6">
+              <b style="font-size:14px">${o.company}</b><br/>${o.event}<br/>
+              🕐 <b>${fmtShort(tm(o.deliveryTime))}</b> · ${o.guests}p · ${o.setupMinutes}min setup<br/>
+              🚐 ~${drv}min · 📍 ${o.address.split(",")[0]}<br/>
+              👤 ${o.contact} ${o.phone}
+            </div>`
           );
         });
       });
-
-      // Fit bounds
-      if (allPoints.length > 1) {
-        map.fitBounds(L.latLngBounds(allPoints).pad(0.1));
-      }
+      if (pts.length > 1) map.fitBounds(L.latLngBounds(pts).pad(0.1));
     }
 
     if (mode === "pickup") {
-      const allPoints = [[HQ.lat, HQ.lng]];
-      const colors = ["#22c55e", "#06b6d4", "#a855f7"];
-
+      const pts = [[HQ.lat, HQ.lng]];
+      const cols = ["#22c55e", "#06b6d4", "#a855f7"];
       pickupRuns.forEach((run, ri) => {
-        const color = colors[ri % colors.length];
-        const waypoints = [HQ, ...run.stops, HQ];
-        const latlngs = waypoints.map(w => [w.lat, w.lng]);
-        allPoints.push(...latlngs);
-
-        // Dashed line immediately
-        const line = L.polyline(latlngs, {
-          color, weight: 3, opacity: 0.4, dashArray: "8,6",
-        }).addTo(map);
-        layersRef.current.pickup.push(line);
-
-        // Real road route
-        fetchOSRMRoute(waypoints).then(routeCoords => {
-          if (!routeCoords || !mapInstance.current) return;
-          map.removeLayer(line);
-          const idx = layersRef.current.pickup.indexOf(line);
-          if (idx > -1) layersRef.current.pickup.splice(idx, 1);
-          const roadLine = L.polyline(routeCoords, { color, weight: 4, opacity: 0.8 }).addTo(map);
-          layersRef.current.pickup.push(roadLine);
+        const col = cols[ri % cols.length];
+        const wps = [HQ, ...run.stops, HQ];
+        const ll = wps.map(w => [w.lat, w.lng]);
+        pts.push(...ll);
+        const dash = L.polyline(ll, { color: col, weight: 3, opacity: 0.35, dashArray: "8,6" }).addTo(map);
+        layers.current.lines.push(dash);
+        dash.on("click", () => {
+          setRoutePanel({ type: "pickup", runIndex: ri, color: col, windowStart: run.windowStart, windowEnd: run.windowEnd, stops: run.stops, totalDrive: run.totalDrive, totalPickupTime: run.totalPickupTime, totalTime: run.totalTime });
         });
-
-        // Pickup markers
-        run.stops.forEach((stop, si) => {
-          const driveTime = gCD(driveCache, si === 0 ? HQ : run.stops[si - 1], stop);
-          addMarker(stop.lat, stop.lng, color, si + 1,
-            `<div style="font-family:sans-serif;font-size:12px">
-              <b style="font-size:14px">📦 ${stop.company}</b><br/>
-              <span style="color:#666">${stop.event}</span><br/><br/>
-              ⏰ Window: <b>${fmtShort(run.windowStart)}–${fmtShort(run.windowEnd)}</b><br/>
-              🚐 ~${driveTime}min from ${si === 0 ? "HQ" : "prev stop"}<br/>
-              📍 ${stop.address}<br/>
-              📋 ${stop.pickup?.note || "—"}<br/>
-              <br/><b>Pickup Run ${ri + 1} · Stop #${si + 1}</b>
-            </div>`,
-            22
+        fetchOSRM(wps).then(rc => {
+          if (!rc || !mapInst.current) return;
+          map.removeLayer(dash);
+          const idx = layers.current.lines.indexOf(dash); if (idx > -1) layers.current.lines.splice(idx, 1);
+          const road = L.polyline(rc, { color: col, weight: 4, opacity: 0.85 }).addTo(map);
+          road.on("click", () => {
+            setRoutePanel({ type: "pickup", runIndex: ri, color: col, windowStart: run.windowStart, windowEnd: run.windowEnd, stops: run.stops, totalDrive: run.totalDrive, totalPickupTime: run.totalPickupTime, totalTime: run.totalTime });
+          });
+          layers.current.lines.push(road);
+        });
+        run.stops.forEach((st, si) => {
+          const drv = gCD(driveCache, si === 0 ? HQ : run.stops[si - 1], st);
+          mkr(st.lat, st.lng, col, si + 1,
+            `<div style="font-family:'DM Sans',sans-serif;font-size:12px;line-height:1.6">
+              <b>📦 ${st.company}</b><br/>
+              ⏰ ${fmtShort(run.windowStart)}–${fmtShort(run.windowEnd)}<br/>
+              🚐 ~${drv}min · 📍 ${st.address.split(",")[0]}
+            </div>`
           );
         });
       });
-
-      if (allPoints.length > 1) map.fitBounds(L.latLngBounds(allPoints).pad(0.1));
+      if (pts.length > 1) map.fitBounds(L.latLngBounds(pts).pad(0.1));
     }
-  }, [mode, selectedDriver, orders, assignments, drivers, deliveryRoutes, pickupRuns, loading, driveCache]);
+  }, [mode, selDriver, orders, assignments, drivers, deliveryRoutes, pickupRuns, loading, driveCache]);
 
   return (
-    <div style={{ flex: 1, display: "flex", flexDirection: "column", position: "relative" }}>
-      {/* Map controls overlay */}
-      <div style={{ position: "absolute", top: 12, left: 12, zIndex: 1000, display: "flex", gap: 8, flexWrap: "wrap" }}>
-        <div style={{ background: "#111520ee", border: "1px solid #1c2333", borderRadius: 8, padding: 6, display: "flex", gap: 2 }}>
-          <button onClick={() => setMode("delivery")} style={{
-            padding: "6px 14px", borderRadius: 5, border: "none", cursor: "pointer",
-            fontFamily: "inherit", fontSize: 11, fontWeight: 600,
-            background: mode === "delivery" ? "#1c2333" : "transparent",
-            color: mode === "delivery" ? "#f59e0b" : "#5b6b82",
-          }}>🚐 Delivery Routes</button>
-          <button onClick={() => setMode("pickup")} style={{
-            padding: "6px 14px", borderRadius: 5, border: "none", cursor: "pointer",
-            fontFamily: "inherit", fontSize: 11, fontWeight: 600,
-            background: mode === "pickup" ? "#1c2333" : "transparent",
-            color: mode === "pickup" ? "#22c55e" : "#5b6b82",
-          }}>📦 Pickup Routes</button>
+    <div style={{ flex: 1, display: "flex", position: "relative" }}>
+      {/* Map */}
+      <div style={{ flex: 1, position: "relative" }}>
+        {/* Controls */}
+        <div style={{ position: "absolute", top: 12, left: 12, zIndex: 1000, display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <div style={{ background: "#1c2029ee", border: "1px solid #2a3242", borderRadius: 8, padding: 5, display: "flex", gap: 2 }}>
+            <button onClick={() => { setMode("delivery"); setRoutePanel(null); }} style={{ padding: "6px 14px", borderRadius: 5, border: "none", cursor: "pointer", fontFamily: "inherit", fontSize: 11, fontWeight: 600, background: mode === "delivery" ? "#262d3a" : "transparent", color: mode === "delivery" ? "#f59e0b" : "#7b879c" }}>🚐 Delivery</button>
+            <button onClick={() => { setMode("pickup"); setRoutePanel(null); }} style={{ padding: "6px 14px", borderRadius: 5, border: "none", cursor: "pointer", fontFamily: "inherit", fontSize: 11, fontWeight: 600, background: mode === "pickup" ? "#262d3a" : "transparent", color: mode === "pickup" ? "#22c55e" : "#7b879c" }}>📦 Pickup</button>
+          </div>
+          {mode === "delivery" && (
+            <div style={{ background: "#1c2029ee", border: "1px solid #2a3242", borderRadius: 8, padding: 5, display: "flex", gap: 2 }}>
+              <button onClick={() => setSelDriver("all")} style={{ padding: "5px 10px", borderRadius: 4, border: "none", cursor: "pointer", fontFamily: "inherit", fontSize: 10, fontWeight: 600, background: selDriver === "all" ? "#262d3a" : "transparent", color: selDriver === "all" ? "#f0f2f7" : "#7b879c" }}>All</button>
+              {drivers.map(d => { const c = (deliveryRoutes[d.id] || []).length; if (!c) return null;
+                return <button key={d.id} onClick={() => { setSelDriver(d.id); setRoutePanel({ type: "delivery", driverId: d.id, driverName: d.name, driverColor: d.color, stops: deliveryRoutes[d.id] }); }} style={{ padding: "5px 10px", borderRadius: 4, border: "none", cursor: "pointer", fontFamily: "inherit", fontSize: 10, fontWeight: 600, background: selDriver === d.id ? "#262d3a" : "transparent", color: selDriver === d.id ? d.color : "#7b879c" }}>
+                  <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: d.color, marginRight: 4 }} />{d.name} ({c})
+                </button> })}
+            </div>
+          )}
         </div>
 
-        {mode === "delivery" && (
-          <div style={{ background: "#111520ee", border: "1px solid #1c2333", borderRadius: 8, padding: 6, display: "flex", gap: 2, alignItems: "center" }}>
-            <button onClick={() => setSelectedDriver("all")} style={{
-              padding: "5px 10px", borderRadius: 4, border: "none", cursor: "pointer",
-              fontFamily: "inherit", fontSize: 10, fontWeight: 600,
-              background: selectedDriver === "all" ? "#1c2333" : "transparent",
-              color: selectedDriver === "all" ? "#eef1f6" : "#5b6b82",
-            }}>All</button>
-            {drivers.map(d => {
-              const cnt = (deliveryRoutes[d.id] || []).length;
-              if (!cnt) return null;
-              return (
-                <button key={d.id} onClick={() => setSelectedDriver(d.id)} style={{
-                  padding: "5px 10px", borderRadius: 4, border: "none", cursor: "pointer",
-                  fontFamily: "inherit", fontSize: 10, fontWeight: 600,
-                  background: selectedDriver === d.id ? "#1c2333" : "transparent",
-                  color: selectedDriver === d.id ? d.color : "#5b6b82",
-                }}>
-                  <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: d.color, marginRight: 4 }} />
-                  {d.name} ({cnt})
-                </button>
-              );
-            })}
-          </div>
-        )}
+        {/* Legend */}
+        <div style={{ position: "absolute", bottom: 28, left: 12, zIndex: 1000, background: "#1c2029ee", border: "1px solid #2a3242", borderRadius: 8, padding: "10px 14px", fontSize: 10, color: "#7b879c", maxWidth: 220 }}>
+          {mode === "delivery" ? <>
+            <div style={{ fontWeight: 700, color: "#f0f2f7", marginBottom: 6 }}>Delivery Routes</div>
+            {drivers.map(d => { const c = (deliveryRoutes[d.id] || []).length; if (!c) return null;
+              return <div key={d.id} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3, cursor: "pointer" }}
+                onClick={() => { setSelDriver(d.id); setRoutePanel({ type: "delivery", driverId: d.id, driverName: d.name, driverColor: d.color, stops: deliveryRoutes[d.id] }); }}>
+                <div style={{ width: 18, height: 3, background: d.color, borderRadius: 2 }} /><span>{d.name} — {c} stops</span>
+              </div> })}
+            <div style={{ marginTop: 4, fontSize: 9, color: "#566078" }}>Click a route or driver to see details</div>
+          </> : <>
+            <div style={{ fontWeight: 700, color: "#f0f2f7", marginBottom: 6 }}>Pickup Runs</div>
+            {pickupRuns.map((run, i) => <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3, cursor: "pointer" }}
+              onClick={() => setRoutePanel({ type: "pickup", runIndex: i, color: ["#22c55e","#06b6d4","#a855f7"][i%3], windowStart: run.windowStart, windowEnd: run.windowEnd, stops: run.stops, totalDrive: run.totalDrive, totalPickupTime: run.totalPickupTime, totalTime: run.totalTime })}>
+              <div style={{ width: 18, height: 3, background: ["#22c55e","#06b6d4","#a855f7"][i%3], borderRadius: 2 }} />
+              <span>Run {i+1}: {fmtShort(run.windowStart)}–{fmtShort(run.windowEnd)}</span>
+            </div>)}
+          </>}
+        </div>
+
+        {loading && <div style={{ position: "absolute", top: "50%", left: "50%", transform: "translate(-50%,-50%)", zIndex: 1000, background: "#1c2029", borderRadius: 8, padding: "16px 24px", color: "#7b879c", fontSize: 12, fontWeight: 600 }}>Loading map...</div>}
+        <div ref={mapRef} style={{ width: "100%", height: "100%", background: "#12151c" }} />
       </div>
 
-      {/* Map legend */}
-      <div style={{ position: "absolute", bottom: 28, right: 12, zIndex: 1000, background: "#111520ee", border: "1px solid #1c2333", borderRadius: 8, padding: "10px 14px", fontSize: 10, color: "#5b6b82" }}>
-        {mode === "delivery" ? (
-          <div>
-            <div style={{ fontWeight: 700, color: "#eef1f6", marginBottom: 6 }}>Delivery Routes</div>
-            {drivers.map(d => {
-              const cnt = (deliveryRoutes[d.id] || []).length;
-              if (!cnt) return null;
-              return (
-                <div key={d.id} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
-                  <div style={{ width: 18, height: 3, background: d.color, borderRadius: 2 }} />
-                  <span>{d.name} — {cnt} stops</span>
-                </div>
-              );
-            })}
-            <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 4 }}>
-              <div style={{ width: 12, height: 12, background: "#f59e0b", borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 8, fontWeight: 900, color: "#000" }}>H</div>
-              <span>Hannibal's HQ</span>
+      {/* Route Detail Panel */}
+      {routePanel && (
+        <div style={{ width: 340, background: "#181c26", borderLeft: "1px solid #252d3a", overflowY: "auto", flexShrink: 0 }} className="fade-in">
+          <div style={{ padding: "14px 16px", borderBottom: "1px solid #252d3a", display: "flex", justifyContent: "space-between", alignItems: "center", position: "sticky", top: 0, background: "#181c26", zIndex: 2 }}>
+            <div>
+              <div style={{ fontFamily: "'DM Sans',sans-serif", fontWeight: 800, fontSize: 15, color: routePanel.driverColor || routePanel.color || "#f0f2f7" }}>
+                {routePanel.type === "delivery" ? `${routePanel.driverName}'s Route` : `Pickup Run ${routePanel.runIndex + 1}`}
+              </div>
+              <div style={{ fontSize: 10, color: "#7b879c", marginTop: 2 }}>
+                {routePanel.stops.length} stop{routePanel.stops.length > 1 ? "s" : ""}
+                {routePanel.type === "pickup" && ` · ${fmtShort(routePanel.windowStart)}–${fmtShort(routePanel.windowEnd)}`}
+              </div>
+            </div>
+            <button onClick={() => setRoutePanel(null)} style={{ background: "#222a36", border: "1px solid #2e3848", borderRadius: 5, padding: "3px 10px", color: "#7b879c", cursor: "pointer", fontFamily: "inherit", fontSize: 11 }}>✕</button>
+          </div>
+
+          {/* HQ departure */}
+          <div style={{ padding: "10px 16px", display: "flex", alignItems: "center", gap: 10, borderBottom: "1px solid #1e2530" }}>
+            <div style={{ width: 28, height: 28, borderRadius: "50%", background: "#f59e0b", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 900, fontSize: 14, color: "#000", flexShrink: 0 }}>H</div>
+            <div>
+              <div style={{ fontFamily: "'DM Sans',sans-serif", fontWeight: 700, fontSize: 12, color: "#f0f2f7" }}>Hannibal's HQ</div>
+              <div style={{ fontSize: 10, color: "#7b879c" }}>Depart</div>
             </div>
           </div>
-        ) : (
-          <div>
-            <div style={{ fontWeight: 700, color: "#eef1f6", marginBottom: 6 }}>Pickup Runs</div>
-            {pickupRuns.map((run, i) => (
-              <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
-                <div style={{ width: 18, height: 3, background: ["#22c55e", "#06b6d4", "#a855f7"][i % 3], borderRadius: 2 }} />
-                <span>Run {i + 1}: {fmtShort(run.windowStart)}–{fmtShort(run.windowEnd)} ({run.stops.length} stops, {run.totalTime}min)</span>
-              </div>
-            ))}
-          </div>
-        )}
-        <div style={{ marginTop: 6, fontSize: 9, color: "#3d4d63" }}>Routes follow real roads via OSRM · Click markers for details</div>
-      </div>
 
-      {loading && (
-        <div style={{ position: "absolute", top: "50%", left: "50%", transform: "translate(-50%,-50%)", zIndex: 1000, background: "#111520", borderRadius: 8, padding: "16px 24px", color: "#5b6b82", fontSize: 12, fontWeight: 600 }}>
-          Loading map...
+          {routePanel.stops.map((stop, i) => {
+            const prev = i === 0 ? HQ : routePanel.stops[i - 1];
+            const drv = gCD(driveCache, prev, stop);
+            const isDelivery = routePanel.type === "delivery";
+            const [bt, bc, bb] = cBadge(stop.complexity);
+            return (
+              <div key={stop.id}>
+                {/* Drive connector */}
+                <div style={{ padding: "6px 16px 6px 30px", display: "flex", alignItems: "center", gap: 8 }}>
+                  <div style={{ width: 1, height: 16, background: "#2e3848" }} />
+                  <span style={{ fontSize: 10, color: "#566078", fontStyle: "italic" }}>🚐 ~{drv} min drive</span>
+                </div>
+                {/* Stop card */}
+                <div style={{ padding: "12px 16px", borderBottom: "1px solid #1e2530", borderLeft: `3px solid ${routePanel.driverColor || routePanel.color}` }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 6 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <div style={{ width: 24, height: 24, borderRadius: "50%", background: routePanel.driverColor || routePanel.color, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700, color: "#fff", flexShrink: 0 }}>{i + 1}</div>
+                      <div>
+                        <div style={{ fontFamily: "'DM Sans',sans-serif", fontWeight: 700, fontSize: 13, color: "#f0f2f7" }}>{stop.company}</div>
+                        <div style={{ fontSize: 10, color: "#7b879c" }}>{stop.event}</div>
+                      </div>
+                    </div>
+                    {isDelivery && <div style={{ textAlign: "right" }}>
+                      <div style={{ fontFamily: "'DM Sans',sans-serif", fontWeight: 800, fontSize: 15, color: "#f0f2f7" }}>{fmtShort(tm(stop.deliveryTime))}</div>
+                      <div style={{ fontSize: 9, color: "#7b879c" }}>serve {fmtShort(tm(stop.servingTime))}</div>
+                    </div>}
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px 12px", fontSize: 11, marginTop: 6 }}>
+                    <div><span style={{ color: "#566078" }}>Guests: </span><span style={{ color: "#e0e5ee" }}>{stop.guests}</span></div>
+                    {isDelivery && <div><span style={{ color: "#566078" }}>Setup: </span><span style={{ color: "#e0e5ee" }}>{stop.setupMinutes}min</span></div>}
+                    <div style={{ gridColumn: "1/-1" }}><span style={{ color: "#566078" }}>📍 </span><span style={{ color: "#e0e5ee", fontSize: 10 }}>{stop.address}</span></div>
+                    {stop.room && <div style={{ gridColumn: "1/-1" }}><span style={{ color: "#566078" }}>Room: </span><span style={{ color: "#e0e5ee" }}>{stop.room}</span></div>}
+                    {stop.contact && <div style={{ gridColumn: "1/-1" }}><span style={{ color: "#566078" }}>👤 </span><span style={{ color: "#e0e5ee" }}>{stop.contact} {stop.phone}</span></div>}
+                  </div>
+                  {isDelivery && <div style={{ marginTop: 6, display: "flex", gap: 4 }}><div className="badge" style={{ background: bb, color: bc }}>{stop.guests}p</div><div className="badge" style={{ background: bb, color: bc }}>{bt}</div></div>}
+                  {stop.notes && <div style={{ marginTop: 6, fontSize: 10, color: "#f59e0b", background: "#26200f", borderRadius: 4, padding: "4px 8px" }}>⚠ {stop.notes.substring(0, 120)}{stop.notes.length > 120 ? "..." : ""}</div>}
+                  {!isDelivery && stop.pickup && <div style={{ marginTop: 6, fontSize: 10, color: "#86efac" }}>📦 {stop.pickup.note}</div>}
+                </div>
+              </div>
+            );
+          })}
+
+          {/* Return to HQ */}
+          <div style={{ padding: "6px 16px 6px 30px", display: "flex", alignItems: "center", gap: 8 }}>
+            <div style={{ width: 1, height: 16, background: "#2e3848" }} />
+            <span style={{ fontSize: 10, color: "#566078", fontStyle: "italic" }}>🚐 ~{gCD(driveCache, routePanel.stops[routePanel.stops.length - 1], HQ)} min return</span>
+          </div>
+          <div style={{ padding: "10px 16px", display: "flex", alignItems: "center", gap: 10, borderTop: "1px solid #1e2530" }}>
+            <div style={{ width: 28, height: 28, borderRadius: "50%", background: "#f59e0b", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 900, fontSize: 14, color: "#000", flexShrink: 0 }}>H</div>
+            <div style={{ fontFamily: "'DM Sans',sans-serif", fontWeight: 700, fontSize: 12, color: "#f0f2f7" }}>Return to HQ</div>
+          </div>
+
+          {/* Summary */}
+          <div style={{ padding: "12px 16px", borderTop: "1px solid #252d3a", background: "#1a1f28" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, fontSize: 11 }}>
+              <div><span style={{ color: "#566078" }}>Total stops:</span> <span style={{ color: "#f0f2f7", fontWeight: 600 }}>{routePanel.stops.length}</span></div>
+              <div><span style={{ color: "#566078" }}>Total guests:</span> <span style={{ color: "#f0f2f7", fontWeight: 600 }}>{routePanel.stops.reduce((s, o) => s + o.guests, 0)}</span></div>
+              {routePanel.type === "pickup" && <>
+                <div><span style={{ color: "#566078" }}>Drive:</span> <span style={{ color: "#86efac", fontWeight: 600 }}>{routePanel.totalDrive}min</span></div>
+                <div><span style={{ color: "#566078" }}>Total:</span> <span style={{ color: "#86efac", fontWeight: 600 }}>{routePanel.totalTime}min</span></div>
+              </>}
+            </div>
+          </div>
         </div>
       )}
-
-      <div ref={mapRef} style={{ flex: 1, width: "100%", background: "#090b10" }} />
     </div>
   );
 }
 
-/* ═══════════════════════════ UPLOAD VIEW ═══════════════════════════ */
-function UploadView({ onOrdersLoaded }) {
+/* ═══════════════════════════ PREVIEW / UPLOAD VIEW ═══════════════════════════ */
+function UploadView({ onOrdersConfirmed }) {
   const [dragging, setDragging] = useState(false);
   const [parsing, setParsing] = useState(false);
   const [error, setError] = useState(null);
   const [log, setLog] = useState([]);
+  const [previewOrders, setPreviewOrders] = useState(null);
+  const [expandedId, setExpandedId] = useState(null);
   const fileRef = useRef(null);
+
   const handleFile = async (file) => {
     if (!file || !file.name.toLowerCase().endsWith(".pdf")) { setError("Upload a CaterTrax Kitchen Sheet PDF"); return; }
     setError(null); setParsing(true); setLog(["Loading PDF.js..."]);
@@ -370,31 +353,194 @@ function UploadView({ onOrdersLoaded }) {
       const text = await extractPdf(file);
       setLog(p => [...p, `Extracted ${text.length.toLocaleString()} chars`]);
       const orders = parseCaterTrax(text);
-      setLog(p => [...p, `Found ${orders.length} orders:`]);
-      orders.forEach(o => setLog(p => [...p, `  ✓ #${o.id} — ${o.company} — ${o.guests}p — ${fmtShort(tm(o.deliveryTime))}`]));
+      setLog(p => [...p, `Found ${orders.length} orders`]);
       if (!orders.length) { setError("No orders found. Check PDF format."); setParsing(false); return; }
-      setTimeout(() => onOrdersLoaded(orders), 600);
+      setPreviewOrders(orders);
     } catch (e) { setError(`Parse error: ${e.message}`); }
     setParsing(false);
   };
-  return (
-    <div style={{ height: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "#090b10", padding: 40 }}>
-      <div style={{ textAlign: "center", maxWidth: 600, width: "100%" }}>
-        <div style={{ fontFamily: "'DM Sans',sans-serif", fontWeight: 800, fontSize: 28, color: "#eef1f6", marginBottom: 4 }}>HANNIBAL'S <span style={{ color: "#f59e0b" }}>DISPATCH</span></div>
-        <div style={{ fontSize: 13, color: "#5b6b82", marginBottom: 32 }}>Upload your CaterTrax Kitchen Sheet to generate today's dispatch</div>
-        <div onDragOver={e => { e.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)}
-          onDrop={e => { e.preventDefault(); setDragging(false); handleFile(e.dataTransfer.files[0]); }}
-          onClick={() => fileRef.current?.click()}
-          style={{ border: `2px dashed ${dragging ? "#f59e0b" : "#1c2333"}`, borderRadius: 12, padding: "48px 32px", cursor: "pointer", background: dragging ? "#17150e" : "#10141c", transition: "all .2s", marginBottom: 20 }}>
-          <input ref={fileRef} type="file" accept=".pdf" style={{ display: "none" }} onChange={e => handleFile(e.target.files[0])} />
-          <div style={{ fontSize: 40, marginBottom: 12 }}>{parsing ? "⏳" : "📄"}</div>
-          <div style={{ fontFamily: "'DM Sans',sans-serif", fontWeight: 700, fontSize: 16, color: "#dde3ec", marginBottom: 8 }}>{parsing ? "Parsing orders..." : "Drop PDF here or click to upload"}</div>
-          <div style={{ fontSize: 11, color: "#5b6b82" }}>CaterTrax Kitchen Sheet Report (.pdf)</div>
+
+  const updateOrder = (id, field, value) => {
+    setPreviewOrders(prev => prev.map(o => o.id === id ? { ...o, [field]: value } : o));
+  };
+
+  const updatePickupType = (id, type) => {
+    setPreviewOrders(prev => prev.map(o => {
+      if (o.id !== id) return o;
+      if (type === "none") return { ...o, pickup: null };
+      const windows = { "same-day": "10:00-16:00", "next-day": "10:00-16:00", "server-cleanup": "17:00-20:00" };
+      const notes = { "same-day": "Same Day Pickup 10AM-4PM", "next-day": "Next Day Pickup 10AM-4PM", "server-cleanup": "Server handles cleanup" };
+      return { ...o, pickup: { type, window: windows[type], note: notes[type] } };
+    }));
+  };
+
+  const updateComplexity = (id, complexity) => {
+    setPreviewOrders(prev => prev.map(o => {
+      if (o.id !== id) return o;
+      return { ...o, complexity, setupMinutes: guessSetup(complexity, o.guests) };
+    }));
+  };
+
+  const removeOrder = (id) => {
+    setPreviewOrders(prev => prev.filter(o => o.id !== id));
+  };
+
+  // Upload screen
+  if (!previewOrders) {
+    return (
+      <div style={{ height: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "#12151c", padding: 40 }}>
+        <div style={{ textAlign: "center", maxWidth: 600, width: "100%" }}>
+          <div style={{ fontFamily: "'DM Sans',sans-serif", fontWeight: 800, fontSize: 28, color: "#f0f2f7", marginBottom: 4 }}>HANNIBAL'S <span style={{ color: "#f59e0b" }}>DISPATCH</span></div>
+          <div style={{ fontSize: 13, color: "#7b879c", marginBottom: 32 }}>Upload your CaterTrax Kitchen Sheet to generate today's dispatch</div>
+          <div onDragOver={e => { e.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)}
+            onDrop={e => { e.preventDefault(); setDragging(false); handleFile(e.dataTransfer.files[0]); }}
+            onClick={() => fileRef.current?.click()}
+            style={{ border: `2px dashed ${dragging ? "#f59e0b" : "#2a3242"}`, borderRadius: 12, padding: "48px 32px", cursor: "pointer", background: dragging ? "#23201a" : "#1a1f28", transition: "all .2s", marginBottom: 20 }}>
+            <input ref={fileRef} type="file" accept=".pdf" style={{ display: "none" }} onChange={e => handleFile(e.target.files[0])} />
+            <div style={{ fontSize: 40, marginBottom: 12 }}>{parsing ? "⏳" : "📄"}</div>
+            <div style={{ fontFamily: "'DM Sans',sans-serif", fontWeight: 700, fontSize: 16, color: "#e0e5ee", marginBottom: 8 }}>{parsing ? "Parsing orders..." : "Drop PDF here or click to upload"}</div>
+            <div style={{ fontSize: 11, color: "#7b879c" }}>CaterTrax Kitchen Sheet Report (.pdf)</div>
+          </div>
+          {error && <div style={{ background: "#201414", border: "1px solid #4a1010", borderRadius: 6, padding: 12, fontSize: 12, color: "#fca5a5", marginBottom: 16, textAlign: "left" }}>✗ {error}</div>}
+          {log.length > 0 && <div style={{ background: "#1a1f28", border: "1px solid #252d3a", borderRadius: 8, padding: 14, textAlign: "left", maxHeight: 180, overflowY: "auto" }}>
+            {log.map((l, i) => <div key={i} style={{ fontSize: 11, color: "#7b879c", fontFamily: "'IBM Plex Mono',monospace", lineHeight: 1.8 }}>{l}</div>)}
+          </div>}
         </div>
-        {error && <div style={{ background: "#1a1010", border: "1px solid #3d0a0a", borderRadius: 6, padding: 12, fontSize: 12, color: "#fca5a5", marginBottom: 16, textAlign: "left" }}>✗ {error}</div>}
-        {log.length > 0 && <div style={{ background: "#10141c", border: "1px solid #181e2a", borderRadius: 8, padding: 14, textAlign: "left", maxHeight: 240, overflowY: "auto" }}>
-          {log.map((l, i) => <div key={i} style={{ fontSize: 11, color: l.startsWith("  ✓") ? "#86efac" : "#5b6b82", fontFamily: "'IBM Plex Mono',monospace", lineHeight: 1.8 }}>{l}</div>)}
-        </div>}
+      </div>
+    );
+  }
+
+  // Preview & Edit screen
+  return (
+    <div style={{ height: "100vh", display: "flex", flexDirection: "column", background: "#12151c" }}>
+      {/* Header */}
+      <div style={{ background: "#181c26", borderBottom: "1px solid #252d3a", padding: "12px 24px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+        <div>
+          <div style={{ fontFamily: "'DM Sans',sans-serif", fontWeight: 800, fontSize: 18, color: "#f0f2f7" }}>
+            Review & Edit Orders <span style={{ color: "#f59e0b" }}>({previewOrders.length})</span>
+          </div>
+          <div style={{ fontSize: 11, color: "#7b879c", marginTop: 2 }}>
+            Verify details, change pickup types, adjust complexity — then dispatch
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 10 }}>
+          <button onClick={() => { setPreviewOrders(null); setLog([]); }} style={{ background: "#222a36", border: "1px solid #2e3848", borderRadius: 6, padding: "8px 18px", color: "#7b879c", fontFamily: "inherit", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>← Re-upload</button>
+          <button onClick={() => onOrdersConfirmed(previewOrders)} style={{ background: "#f59e0b", border: "none", borderRadius: 6, padding: "8px 24px", color: "#000", fontFamily: "'DM Sans',sans-serif", fontSize: 13, fontWeight: 800, cursor: "pointer", boxShadow: "0 2px 8px rgba(245,158,11,.3)" }}>
+            Dispatch {previewOrders.length} Orders →
+          </button>
+        </div>
+      </div>
+
+      {/* Order list */}
+      <div style={{ flex: 1, overflowY: "auto", padding: "16px 24px" }}>
+        {[...previewOrders].sort((a, b) => tm(a.deliveryTime) - tm(b.deliveryTime)).map((o, idx) => {
+          const [bt, bc, bb] = cBadge(o.complexity);
+          const expanded = expandedId === o.id;
+          return (
+            <div key={o.id} className="preview-card fade-in" style={{ animationDelay: `${idx * 30}ms`, borderLeft: `4px solid ${o.complexity === "vip" ? "#fbbf24" : o.complexity === "bar-event" ? "#c4b5fd" : "#3b82f6"}` }}>
+              {/* Collapsed row */}
+              <div style={{ display: "flex", alignItems: "center", gap: 12, cursor: "pointer" }} onClick={() => setExpandedId(expanded ? null : o.id)}>
+                <div style={{ fontFamily: "'DM Sans',sans-serif", fontWeight: 800, fontSize: 16, color: "#f0f2f7", width: 52 }}>{fmtShort(tm(o.deliveryTime))}</div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontFamily: "'DM Sans',sans-serif", fontWeight: 700, fontSize: 13, color: "#e0e5ee" }}>{o.company}</div>
+                  <div style={{ fontSize: 10, color: "#7b879c" }}>{o.event} · {o.address.split(",")[0]}</div>
+                </div>
+                <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+                  <div className="badge" style={{ background: bb, color: bc }}>{o.guests}p</div>
+                  <div className="badge" style={{ background: bb, color: bc }}>{bt}</div>
+                  {o.pickup ? <div className="badge" style={{ background: "#14532d", color: "#86efac" }}>📦 {o.pickup.type}</div> : <div className="badge" style={{ background: "#222a36", color: "#566078" }}>No pickup</div>}
+                </div>
+                <div style={{ fontSize: 16, color: "#566078", transition: "transform .15s", transform: expanded ? "rotate(180deg)" : "rotate(0)" }}>▾</div>
+                <button onClick={e => { e.stopPropagation(); removeOrder(o.id); }} style={{ background: "none", border: "none", color: "#ef4444", cursor: "pointer", fontSize: 14, padding: 4, opacity: 0.5 }} title="Remove order">✕</button>
+              </div>
+
+              {/* Expanded edit */}
+              {expanded && (
+                <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid #252d3a" }} className="fade-in">
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "10px 16px" }}>
+                    <div>
+                      <div className="dlbl">Company</div>
+                      <input className="preview-input" value={o.company} onChange={e => updateOrder(o.id, "company", e.target.value)} />
+                    </div>
+                    <div>
+                      <div className="dlbl">Event</div>
+                      <input className="preview-input" value={o.event} onChange={e => updateOrder(o.id, "event", e.target.value)} />
+                    </div>
+                    <div>
+                      <div className="dlbl">Guests</div>
+                      <input className="preview-input" type="number" value={o.guests} onChange={e => updateOrder(o.id, "guests", parseInt(e.target.value) || 0)} />
+                    </div>
+                    <div>
+                      <div className="dlbl">Delivery Time</div>
+                      <input className="preview-input" type="time" value={o.deliveryTime} onChange={e => updateOrder(o.id, "deliveryTime", e.target.value)} />
+                    </div>
+                    <div>
+                      <div className="dlbl">Serving Time</div>
+                      <input className="preview-input" type="time" value={o.servingTime} onChange={e => updateOrder(o.id, "servingTime", e.target.value)} />
+                    </div>
+                    <div>
+                      <div className="dlbl">Setup (min)</div>
+                      <input className="preview-input" type="number" value={o.setupMinutes} onChange={e => updateOrder(o.id, "setupMinutes", parseInt(e.target.value) || 10)} />
+                    </div>
+                    <div>
+                      <div className="dlbl">Complexity</div>
+                      <select className="preview-select" value={o.complexity} onChange={e => updateComplexity(o.id, e.target.value)} style={{ width: "100%" }}>
+                        {COMPLEXITY_OPTS.map(c => <option key={c} value={c}>{c.toUpperCase()}</option>)}
+                      </select>
+                    </div>
+                    <div>
+                      <div className="dlbl">Pickup Type</div>
+                      <select className="preview-select" value={o.pickup?.type || "none"} onChange={e => updatePickupType(o.id, e.target.value)} style={{ width: "100%", background: o.pickup ? "#162014" : "#222a36", color: o.pickup ? "#86efac" : "#d0d6e0" }}>
+                        {PICKUP_TYPES.map(t => <option key={t} value={t}>{t === "none" ? "No Pickup" : t.replace("-", " ").toUpperCase()}</option>)}
+                      </select>
+                    </div>
+                    <div>
+                      <div className="dlbl">Room/Floor</div>
+                      <input className="preview-input" value={o.room} onChange={e => updateOrder(o.id, "room", e.target.value)} />
+                    </div>
+                    <div style={{ gridColumn: "1/-1" }}>
+                      <div className="dlbl">Address</div>
+                      <input className="preview-input" value={o.address} onChange={e => updateOrder(o.id, "address", e.target.value)} />
+                    </div>
+                    <div>
+                      <div className="dlbl">Contact</div>
+                      <input className="preview-input" value={o.contact} onChange={e => updateOrder(o.id, "contact", e.target.value)} />
+                    </div>
+                    <div>
+                      <div className="dlbl">Phone</div>
+                      <input className="preview-input" value={o.phone} onChange={e => updateOrder(o.id, "phone", e.target.value)} />
+                    </div>
+                    <div>
+                      <div className="dlbl">Order ID</div>
+                      <input className="preview-input" value={o.id} disabled style={{ opacity: 0.5 }} />
+                    </div>
+                    <div style={{ gridColumn: "1/-1" }}>
+                      <div className="dlbl">Menu</div>
+                      <textarea className="preview-input" rows={2} value={o.menu} onChange={e => updateOrder(o.id, "menu", e.target.value)} style={{ resize: "vertical" }} />
+                    </div>
+                    <div style={{ gridColumn: "1/-1" }}>
+                      <div className="dlbl">Notes</div>
+                      <textarea className="preview-input" rows={2} value={o.notes} onChange={e => updateOrder(o.id, "notes", e.target.value)} style={{ resize: "vertical" }} />
+                    </div>
+                  </div>
+                  {o.pickup && (
+                    <div style={{ marginTop: 10, background: "#162014", border: "1px solid #244028", borderRadius: 6, padding: "8px 12px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <div style={{ fontSize: 11, color: "#86efac" }}>📦 {o.pickup.note}</div>
+                      <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                        <span style={{ fontSize: 10, color: "#7b879c" }}>Window:</span>
+                        <input className="preview-input" style={{ width: 100, background: "#1a3020", borderColor: "#2a4030" }}
+                          value={o.pickup.window} onChange={e => {
+                            const w = e.target.value;
+                            setPreviewOrders(p => p.map(x => x.id === o.id ? { ...x, pickup: { ...x.pickup, window: w } } : x));
+                          }} placeholder="HH:MM-HH:MM" />
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -416,7 +562,7 @@ export default function App() {
   const [dropT, setDropT] = useState(null);
   const [mapsL, setMapsL] = useState(false);
   const [pkRuns, setPkRuns] = useState([]);
-  const [showUp, setShowUp] = useState(true);
+  const [phase, setPhase] = useState("upload"); // upload | dispatch
   const upRef = useRef(null);
 
   const rebuild = useCallback((a, cache, o) => {
@@ -425,17 +571,24 @@ export default function App() {
     setPkRuns(groupPickups(ords.filter(x => x.pickup && x.pickup.type === "same-day"), c));
   }, [orders, drivers, dc]);
 
-  const onLoaded = useCallback((newO) => {
-    setOrders(newO);
-    const a = autoAssign(newO, drivers, dc);
-    setAsgn(a); setSched(buildSched(newO, a, drivers, dc));
-    setPkRuns(groupPickups(newO.filter(x => x.pickup && x.pickup.type === "same-day"), dc));
-    setShowUp(false);
+  const onConfirmed = useCallback((confirmed) => {
+    // Re-resolve coordinates for any edited addresses
+    const resolved = confirmed.map(o => {
+      const coords = guessCo(o.address);
+      return { ...o, lat: coords.lat, lng: coords.lng };
+    });
+    setOrders(resolved);
+    const a = autoAssign(resolved, drivers, dc);
+    setAsgn(a); setSched(buildSched(resolved, a, drivers, dc));
+    setPkRuns(groupPickups(resolved.filter(x => x.pickup && x.pickup.type === "same-day"), dc));
+    setPhase("dispatch");
   }, [drivers, dc]);
 
   const handleNewUp = async (f) => {
     if (!f) return;
-    try { const t = await extractPdf(f); const o = parseCaterTrax(t); if (o.length) onLoaded(o); } catch (e) { console.error(e); }
+    try { const t = await extractPdf(f); const o = parseCaterTrax(t); if (o.length) { setPhase("upload"); setTimeout(() => {}, 50); } } catch (e) { console.error(e); }
+    // Go back to upload screen for new file
+    setPhase("upload");
   };
 
   const fetchMaps = useCallback(async () => {
@@ -467,12 +620,11 @@ export default function App() {
   const allPk = useMemo(() => orders.filter(o => o.pickup).map(o => ({ ...o, ws: o.pickup.window.split("-")[0], we: o.pickup.window.split("-")[1], driver: asgn[o.id] })).sort((a, b) => tm(a.ws) - tm(b.ws)), [orders, asgn]);
   const today = new Date().toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", year: "numeric" });
 
-  if (showUp) return <UploadView onOrdersLoaded={onLoaded} />;
+  if (phase === "upload") return <UploadView onOrdersConfirmed={onConfirmed} />;
 
   return (
     <div style={{ height: "100vh", display: "flex", flexDirection: "column" }}>
-      <input ref={upRef} type="file" accept=".pdf" style={{ display: "none" }} onChange={e => handleNewUp(e.target.files[0])} />
-
+      <input ref={upRef} type="file" accept=".pdf" style={{ display: "none" }} onChange={e => { if (e.target.files[0]) setPhase("upload"); }} />
       {/* HEADER */}
       <div className="hdr">
         <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
@@ -483,17 +635,14 @@ export default function App() {
             <div className="pill"><b>{stats.e}</b><span>First</span></div>
             <div className="pill"><b>{stats.l}</b><span>Last</span></div>
           </div>
-          <div style={{ fontSize: 10, padding: "3px 8px", borderRadius: 4, fontWeight: 600, letterSpacing: .5, background: apiSt === "ok" ? "#132010" : "#111520", color: apiSt === "ok" ? "#86efac" : "#5b6b82" }}>
-            {apiSt === "ok" ? "● LIVE" : "○ EST"}
-          </div>
+          <div style={{ fontSize: 10, padding: "3px 8px", borderRadius: 4, fontWeight: 600, letterSpacing: .5, background: apiSt === "ok" ? "#162014" : "#1c2029", color: apiSt === "ok" ? "#86efac" : "#7b879c" }}>{apiSt === "ok" ? "● LIVE" : "○ EST"}</div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-          <button onClick={() => upRef.current?.click()} style={{ background: "#1c2333", border: "1px solid #252e40", borderRadius: 5, padding: "5px 14px", color: "#f59e0b", fontFamily: "inherit", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>📄 Upload PDF</button>
-          <div style={{ fontSize: 11, color: "#5b6b82" }}>{today}</div>
+          <button onClick={() => setPhase("upload")} style={{ background: "#262d3a", border: "1px solid #3a4560", borderRadius: 5, padding: "5px 14px", color: "#f59e0b", fontFamily: "inherit", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>📄 New PDF</button>
+          <div style={{ fontSize: 11, color: "#7b879c" }}>{today}</div>
           <div className="tabs">
-            {[["map", "🗺 Map"], ["timeline", "⏱ Timeline"], ["orders", "📋 Orders"], ["pickups", "📦 Pickups"], ["settings", "⚙ Maps"]].map(([v, l]) => (
-              <button key={v} className={`tab ${view === v ? "on" : ""}`} onClick={() => setView(v)}>{l}</button>
-            ))}
+            {[["map","🗺 Map"],["timeline","⏱ Timeline"],["orders","📋 Orders"],["pickups","📦 Pickups"],["settings","⚙ Maps"]].map(([v,l])=>
+              <button key={v} className={`tab ${view===v?"on":""}`} onClick={()=>setView(v)}>{l}</button>)}
           </div>
         </div>
       </div>
@@ -503,169 +652,83 @@ export default function App() {
         <div className="side">
           <div className="sec">
             <div className="stitle">Drivers</div>
-            {drivers.map(d => {
-              const cnt = Object.values(asgn).filter(a => a === d.id).length;
-              const g = stats.dl[d.id] || 0;
-              const isE = editDrv === d.id, isD = dropT === d.id;
-              return (<div key={d.id} className={`dcard ${isE ? "editing" : ""} ${isD ? "drop-target" : ""}`}
-                onClick={() => setEditDrv(isE ? null : d.id)} onDragOver={e => dOver(e, d.id)} onDragLeave={dLeave} onDrop={e => dDrop(e, d.id)}>
-                <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 5 }}>
-                  <div className="ddot" style={{ background: d.color }} />
-                  {isE ? <input className="dinput" value={d.name} onChange={e => { e.stopPropagation(); setDrivers(p => p.map(x => x.id === d.id ? { ...x, name: e.target.value } : x)); }} onClick={e => e.stopPropagation()} autoFocus />
-                    : <span style={{ fontWeight: 600, color: "#dde3ec", fontSize: 12, fontFamily: "'DM Sans',sans-serif" }}>{d.name}</span>}
-                </div>
-                {isE ? <div style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 10, color: "#5b6b82" }}>
-                  <div style={{ display: "flex", gap: 6, alignItems: "center" }}><span style={{ width: 36 }}>Start:</span><input className="dinput" type="time" value={d.available} onChange={e => { e.stopPropagation(); setDrivers(p => p.map(x => x.id === d.id ? { ...x, available: e.target.value } : x)); }} onClick={e => e.stopPropagation()} style={{ width: 100 }} /></div>
-                  <div style={{ display: "flex", gap: 6, alignItems: "center" }}><span style={{ width: 36 }}>End:</span><input className="dinput" type="time" value={d.end} onChange={e => { e.stopPropagation(); setDrivers(p => p.map(x => x.id === d.id ? { ...x, end: e.target.value } : x)); }} onClick={e => e.stopPropagation()} style={{ width: 100 }} /></div>
-                </div> : <div style={{ fontSize: 10, color: "#5b6b82" }}>{fmtShort(tm(d.available))} – {fmtShort(tm(d.end))}</div>}
-                <div style={{ fontSize: 10, color: "#5b6b82", marginTop: 3 }}>{cnt} deliver{cnt !== 1 ? "ies" : "y"} · {g} guests</div>
-              </div>);
-            })}
+            {drivers.map(d=>{const cnt=Object.values(asgn).filter(a=>a===d.id).length;const g=stats.dl[d.id]||0;const isE=editDrv===d.id,isD=dropT===d.id;
+              return <div key={d.id} className={`dcard ${isE?"editing":""} ${isD?"drop-target":""}`} onClick={()=>setEditDrv(isE?null:d.id)} onDragOver={e=>dOver(e,d.id)} onDragLeave={dLeave} onDrop={e=>dDrop(e,d.id)}>
+                <div style={{display:"flex",alignItems:"center",gap:7,marginBottom:5}}><div className="ddot" style={{background:d.color}}/>{isE?<input className="dinput" value={d.name} onChange={e=>{e.stopPropagation();setDrivers(p=>p.map(x=>x.id===d.id?{...x,name:e.target.value}:x))}} onClick={e=>e.stopPropagation()} autoFocus/>:<span style={{fontWeight:600,color:"#e0e5ee",fontSize:12,fontFamily:"'DM Sans',sans-serif"}}>{d.name}</span>}</div>
+                {isE?<div style={{display:"flex",flexDirection:"column",gap:4,fontSize:10,color:"#7b879c"}}><div style={{display:"flex",gap:6,alignItems:"center"}}><span style={{width:36}}>Start:</span><input className="dinput" type="time" value={d.available} onChange={e=>{e.stopPropagation();setDrivers(p=>p.map(x=>x.id===d.id?{...x,available:e.target.value}:x))}} onClick={e=>e.stopPropagation()} style={{width:100}}/></div><div style={{display:"flex",gap:6,alignItems:"center"}}><span style={{width:36}}>End:</span><input className="dinput" type="time" value={d.end} onChange={e=>{e.stopPropagation();setDrivers(p=>p.map(x=>x.id===d.id?{...x,end:e.target.value}:x))}} onClick={e=>e.stopPropagation()} style={{width:100}}/></div></div>:<div style={{fontSize:10,color:"#7b879c"}}>{fmtShort(tm(d.available))} – {fmtShort(tm(d.end))}</div>}
+                <div style={{fontSize:10,color:"#7b879c",marginTop:3}}>{cnt} deliver{cnt!==1?"ies":"y"} · {g} guests</div>
+              </div>})}
           </div>
           <div className="sec">
             <div className="stitle">Orders ({orders.length})</div>
-            {[...orders].sort((a, b) => tm(a.deliveryTime) - tm(b.deliveryTime)).map(o => {
-              const did = asgn[o.id]; const [bt, bc, bb] = cBadge(o.complexity);
-              return (<div key={o.id} className={`ocard ${selOrder === o.id ? "sel" : ""}`} style={{ opacity: drag?.orderId === o.id ? .35 : 1 }}
-                onClick={() => setSelOrder(selOrder === o.id ? null : o.id)} draggable onDragStart={e => dStart(e, o.id, did)} onDragEnd={dEnd}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 3 }}>
-                  <div className="otime">{fmtShort(tm(o.deliveryTime))}</div>
-                  <div style={{ display: "flex", gap: 3 }}><div className="badge" style={{ background: bb, color: bc }}>{o.guests}p</div><div className="badge" style={{ background: bb, color: bc }}>{bt}</div></div>
-                </div>
-                <div className="ocomp">{o.company}</div><div className="odet">{o.event}</div>
-                <div className="odet" style={{ marginTop: 2 }}>{o.address.split(",")[0]}</div>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 6 }}>
-                  <select className="dsel" value={did || ""} onChange={e => { e.stopPropagation(); reassign(o.id, e.target.value); }} onClick={e => e.stopPropagation()} style={{ borderLeft: `3px solid ${dcol(did)}` }}>
-                    {drivers.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
-                  </select><span style={{ fontSize: 9, color: "#3d4d63" }}>#{o.id}</span>
-                </div>
-              </div>);
-            })}
+            {[...orders].sort((a,b)=>tm(a.deliveryTime)-tm(b.deliveryTime)).map(o=>{const did=asgn[o.id];const[bt,bc,bb]=cBadge(o.complexity);
+              return <div key={o.id} className={`ocard ${selOrder===o.id?"sel":""}`} style={{opacity:drag?.orderId===o.id?.35:1}} onClick={()=>setSelOrder(selOrder===o.id?null:o.id)} draggable onDragStart={e=>dStart(e,o.id,did)} onDragEnd={dEnd}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:3}}><div className="otime">{fmtShort(tm(o.deliveryTime))}</div><div style={{display:"flex",gap:3}}><div className="badge" style={{background:bb,color:bc}}>{o.guests}p</div><div className="badge" style={{background:bb,color:bc}}>{bt}</div></div></div>
+                <div className="ocomp">{o.company}</div><div className="odet">{o.event}</div><div className="odet" style={{marginTop:2}}>{o.address.split(",")[0]}</div>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:6}}><select className="dsel" value={did||""} onChange={e=>{e.stopPropagation();reassign(o.id,e.target.value)}} onClick={e=>e.stopPropagation()} style={{borderLeft:`3px solid ${dcol(did)}`}}>{drivers.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select><span style={{fontSize:9,color:"#566078"}}>#{o.id}</span></div>
+              </div>})}
           </div>
         </div>
 
         {/* MAIN */}
-        <div style={{ display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        <div style={{display:"flex",flexDirection:"column",overflow:"hidden"}}>
+          {view==="map"&&<MapView orders={orders} assignments={asgn} drivers={drivers} pickupRuns={pkRuns} driveCache={dc} schedule={sched}/>}
 
-          {/* MAP */}
-          {view === "map" && <MapView orders={orders} assignments={asgn} drivers={drivers} pickupRuns={pkRuns} driveCache={dc} />}
+          {view==="timeline"&&<><div className="tl-wrap"><div style={{minWidth:1100}}>
+            <div className="tl-hdr">{HR.map(h=><div key={h} className="tl-h">{h}</div>)}</div>
+            {drivers.map(d=>{const blocks=sched[d.id]||[];const tot=TL_END-TL_START;return<div key={d.id} className={`tl-row ${dropT===d.id?"drop-over":""}`} onDragOver={e=>dOver(e,d.id)} onDragLeave={dLeave} onDrop={e=>dDrop(e,d.id)}>
+              <div className="tl-lbl"><div className="ddot" style={{background:d.color}}/><span style={{fontSize:11,fontWeight:600,color:"#e0e5ee",fontFamily:"'DM Sans',sans-serif"}}>{d.name}</span></div>
+              <div className="tl-track">{HR.map((_,i)=><div key={i} style={{position:"absolute",left:`${(i/HR.length)*100}%`,top:0,bottom:0,width:1,background:"#1e2530"}}/>)}
+                {nowM>=TL_START&&nowM<=TL_END&&d===drivers[0]&&<div className="now" style={{left:`${((nowM-TL_START)/tot)*100}%`,bottom:`-${(drivers.length-1)*52+20}px`}}/>}
+                {blocks.map((b,i)=>{const l=((b.start-TL_START)/tot)*100,w=(b.duration/tot)*100;if(l>100||l+w<0)return null;
+                  return<div key={i} className={`tl-blk ${b.type}`} style={{left:`${Math.max(0,l)}%`,width:`${Math.max(.3,w)}%`,background:d.color}} title={`${b.label}\n${fmt(b.start)} – ${fmt(b.start+b.duration)}`} onClick={()=>b.orderId&&setSelOrder(b.orderId)} draggable={!!b.orderId} onDragStart={e=>b.orderId&&dStart(e,b.orderId,d.id)} onDragEnd={dEnd}>{w>2&&<span style={{fontSize:8,overflow:"hidden",textOverflow:"ellipsis"}}>{b.label}</span>}</div>})}
+              </div></div>})}
+          </div></div>
+          {selOrder&&(()=>{const o=orders.find(x=>x.id===selOrder);if(!o)return null;const drv=gCD(dc,HQ,o),mi=hvMi(HQ,o).toFixed(1);
+            return<div className="detail fade-in" key={selOrder}><div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10}}><div><div style={{fontFamily:"'DM Sans',sans-serif",fontWeight:800,fontSize:17,color:"#f0f2f7"}}>{o.company}</div><div style={{fontSize:12,color:"#7b879c"}}>{o.event} · #{o.id}</div></div><button onClick={()=>setSelOrder(null)} style={{background:"#222a36",border:"1px solid #2e3848",borderRadius:5,padding:"3px 10px",color:"#7b879c",cursor:"pointer",fontFamily:"inherit",fontSize:11}}>✕</button></div>
+              <div className="dgrid"><div><div className="dlbl">Delivery</div><div className="dval">{fmt(tm(o.deliveryTime))}</div></div><div><div className="dlbl">Serving</div><div className="dval">{fmt(tm(o.servingTime))}</div></div><div><div className="dlbl">Guests</div><div className="dval">{o.guests}</div></div><div><div className="dlbl">Setup</div><div className="dval">{o.setupMinutes}min</div></div><div><div className="dlbl">Drive</div><div className="dval">~{drv}min · {mi}mi</div></div><div><div className="dlbl">Load</div><div className="dval">{loadMin(o.complexity)}min</div></div><div><div className="dlbl">Contact</div><div className="dval">{o.contact} · {o.phone}</div></div><div><div className="dlbl">Room</div><div className="dval">{o.room}</div></div><div><div className="dlbl">Driver</div><div className="dval" style={{color:dcol(asgn[o.id])}}>{dnam(asgn[o.id])}</div></div><div style={{gridColumn:"1/-1"}}><div className="dlbl">Address</div><div className="dval">{o.address}</div></div><div style={{gridColumn:"1/-1"}}><div className="dlbl">Menu</div><div className="dval" style={{fontSize:11,lineHeight:1.7}}>{o.menu}</div></div></div>
+              {o.notes&&<div className="nbox">⚠ {o.notes}</div>}{o.pickup&&<div style={{marginTop:8,background:"#162014",border:"1px solid #244028",borderRadius:5,padding:8,fontSize:11,color:"#86efac"}}>📦 {o.pickup.note}</div>}
+            </div>})()}</>}
 
-          {/* TIMELINE */}
-          {view === "timeline" && (<>
-            <div className="tl-wrap"><div style={{ minWidth: 1100 }}>
-              <div className="tl-hdr">{HR.map(h => <div key={h} className="tl-h">{h}</div>)}</div>
-              {drivers.map(d => {
-                const blocks = sched[d.id] || []; const tot = TL_END - TL_START;
-                return (<div key={d.id} className={`tl-row ${dropT === d.id ? "drop-over" : ""}`} onDragOver={e => dOver(e, d.id)} onDragLeave={dLeave} onDrop={e => dDrop(e, d.id)}>
-                  <div className="tl-lbl"><div className="ddot" style={{ background: d.color }} /><span style={{ fontSize: 11, fontWeight: 600, color: "#dde3ec", fontFamily: "'DM Sans',sans-serif" }}>{d.name}</span></div>
-                  <div className="tl-track">
-                    {HR.map((_, i) => <div key={i} style={{ position: "absolute", left: `${(i / HR.length) * 100}%`, top: 0, bottom: 0, width: 1, background: "#12161f" }} />)}
-                    {nowM >= TL_START && nowM <= TL_END && d === drivers[0] && <div className="now" style={{ left: `${((nowM - TL_START) / tot) * 100}%`, bottom: `-${(drivers.length - 1) * 52 + 20}px` }} />}
-                    {blocks.map((b, i) => { const l = ((b.start - TL_START) / tot) * 100, w = (b.duration / tot) * 100; if (l > 100 || l + w < 0) return null;
-                      return <div key={i} className={`tl-blk ${b.type}`} style={{ left: `${Math.max(0, l)}%`, width: `${Math.max(.3, w)}%`, background: d.color }}
-                        title={`${b.label}\n${fmt(b.start)} – ${fmt(b.start + b.duration)}\n${b.detail || ""}`}
-                        onClick={() => b.orderId && setSelOrder(b.orderId)} draggable={!!b.orderId}
-                        onDragStart={e => b.orderId && dStart(e, b.orderId, d.id)} onDragEnd={dEnd}>
-                        {w > 2 && <span style={{ fontSize: 8, overflow: "hidden", textOverflow: "ellipsis" }}>{b.label}</span>}
-                      </div> })}
-                  </div>
-                </div>);
-              })}
-              {allPk.filter(p => p.pickup.type === "same-day").length > 0 && <div style={{ marginTop: 12, borderTop: "1px solid #151b27", paddingTop: 8 }}>
-                <div style={{ marginLeft: 110, marginBottom: 6, fontSize: 9, color: "#3d4d63", textTransform: "uppercase", letterSpacing: 1, fontWeight: 600 }}>Pickup Windows</div>
-                {allPk.filter(p => p.pickup.type === "same-day").map(p => { const tot = TL_END - TL_START, s = tm(p.ws), e = tm(p.we);
-                  return <div key={p.id} className="tl-row" style={{ height: 30 }}>
-                    <div className="tl-lbl"><span style={{ fontSize: 9, color: "#5b6b82" }}>📦 {p.company}</span></div>
-                    <div className="tl-track" style={{ height: 22 }}>{HR.map((_, i) => <div key={i} style={{ position: "absolute", left: `${(i / HR.length) * 100}%`, top: 0, bottom: 0, width: 1, background: "#12161f" }} />)}
-                      <div style={{ position: "absolute", left: `${((s - TL_START) / tot) * 100}%`, width: `${((e - s) / tot) * 100}%`, height: 16, top: 3, background: "#0f1a12", border: "1px dashed #22c55e33", borderRadius: 3, display: "flex", alignItems: "center", paddingLeft: 7, fontSize: 8, color: "#86efac" }}>{fmtShort(s)}–{fmtShort(e)}</div>
-                    </div></div> })}
-              </div>}
-            </div></div>
-            {selOrder && (() => { const o = orders.find(x => x.id === selOrder); if (!o) return null; const drv = gCD(dc, HQ, o), mi = hvMi(HQ, o).toFixed(1);
-              return <div className="detail fade-in" key={selOrder}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 10 }}>
-                  <div><div style={{ fontFamily: "'DM Sans',sans-serif", fontWeight: 800, fontSize: 17, color: "#eef1f6" }}>{o.company}</div><div style={{ fontSize: 12, color: "#5b6b82" }}>{o.event} · #{o.id}</div></div>
-                  <button onClick={() => setSelOrder(null)} style={{ background: "#151b27", border: "1px solid #1c2333", borderRadius: 5, padding: "3px 10px", color: "#5b6b82", cursor: "pointer", fontFamily: "inherit", fontSize: 11 }}>✕</button>
-                </div>
-                <div className="dgrid">
-                  <div><div className="dlbl">Delivery</div><div className="dval">{fmt(tm(o.deliveryTime))}</div></div>
-                  <div><div className="dlbl">Serving</div><div className="dval">{fmt(tm(o.servingTime))}</div></div>
-                  <div><div className="dlbl">Guests</div><div className="dval">{o.guests}</div></div>
-                  <div><div className="dlbl">Setup</div><div className="dval">{o.setupMinutes}min</div></div>
-                  <div><div className="dlbl">Drive</div><div className="dval">~{drv}min · {mi}mi</div></div>
-                  <div><div className="dlbl">Load</div><div className="dval">{loadMin(o.complexity)}min</div></div>
-                  <div><div className="dlbl">Contact</div><div className="dval">{o.contact} · {o.phone}</div></div>
-                  <div><div className="dlbl">Room</div><div className="dval">{o.room}</div></div>
-                  <div><div className="dlbl">Driver</div><div className="dval" style={{ color: dcol(asgn[o.id]) }}>{dnam(asgn[o.id])}</div></div>
-                  <div style={{ gridColumn: "1/-1" }}><div className="dlbl">Address</div><div className="dval">{o.address}</div></div>
-                  <div style={{ gridColumn: "1/-1" }}><div className="dlbl">Menu</div><div className="dval" style={{ fontSize: 11, lineHeight: 1.7 }}>{o.menu}</div></div>
-                </div>
-                {o.notes && <div className="nbox">⚠ {o.notes}</div>}
-                {o.pickup && <div style={{ marginTop: 8, background: "#0f1a12", border: "1px solid #1a3020", borderRadius: 5, padding: 8, fontSize: 11, color: "#86efac" }}>📦 {o.pickup.note}</div>}
-              </div> })()}
-          </>)}
-
-          {/* ORDERS */}
-          {view === "orders" && <div style={{ flex: 1, overflow: "auto", padding: 20 }}><div style={{ display: "grid", gap: 10 }}>
-            {[...orders].sort((a, b) => tm(a.deliveryTime) - tm(b.deliveryTime)).map((o, idx) => {
-              const [bt, bc, bb] = cBadge(o.complexity);
-              return <div key={o.id} className="fade-in" style={{ animationDelay: `${idx * 25}ms`, background: "#10141c", border: "1px solid #181e2a", borderRadius: 9, padding: 16, borderLeft: `4px solid ${dcol(asgn[o.id])}` }}>
-                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
-                  <div><div style={{ fontFamily: "'DM Sans',sans-serif", fontWeight: 800, fontSize: 16, color: "#eef1f6" }}>{o.company}</div><div style={{ fontSize: 11, color: "#5b6b82", marginTop: 2 }}>{o.event}</div></div>
-                  <div style={{ textAlign: "right" }}><div style={{ fontSize: 20, fontWeight: 800, color: "#eef1f6", fontFamily: "'DM Sans',sans-serif" }}>{fmtShort(tm(o.deliveryTime))}</div><div style={{ fontSize: 10, color: "#5b6b82" }}>Serve {fmtShort(tm(o.servingTime))}</div></div>
-                </div>
-                <div className="dgrid" style={{ marginBottom: 10 }}>
-                  <div><div className="dlbl">Guests</div><div className="dval">{o.guests}</div></div>
-                  <div><div className="dlbl">Setup</div><div className="dval">{o.setupMinutes}min</div></div>
-                  <div><div className="dlbl">Type</div><div className="badge" style={{ background: bb, color: bc }}>{bt}</div></div>
-                  <div><div className="dlbl">Contact</div><div className="dval">{o.contact}</div></div>
-                  <div><div className="dlbl">Phone</div><div className="dval">{o.phone}</div></div>
-                  <div><div className="dlbl">Driver</div><div className="dval" style={{ color: dcol(asgn[o.id]) }}>{dnam(asgn[o.id])}</div></div>
-                  <div style={{ gridColumn: "1/-1" }}><div className="dlbl">Address</div><div className="dval">{o.address} · {o.room}</div></div>
-                </div>
-                <div><div className="dlbl">Menu</div><div className="dval" style={{ fontSize: 11, lineHeight: 1.6 }}>{o.menu}</div></div>
-                {o.notes && <div className="nbox">⚠ {o.notes}</div>}
-                {o.pickup && <div style={{ marginTop: 8, background: "#0f1a12", border: "1px solid #1a3020", borderRadius: 5, padding: 8, fontSize: 11, color: "#86efac" }}>📦 {o.pickup.note}</div>}
-                <div style={{ marginTop: 8, display: "flex", justifyContent: "space-between", fontSize: 9, color: "#3d4d63" }}><span>#{o.id} · {o.salesRep || "—"}</span>{o.masterInvoice && <span style={{ color: "#f59e0b" }}>Master #{o.masterInvoice}</span>}</div>
-              </div>
-            })}
+          {view==="orders"&&<div style={{flex:1,overflow:"auto",padding:20}}><div style={{display:"grid",gap:10}}>
+            {[...orders].sort((a,b)=>tm(a.deliveryTime)-tm(b.deliveryTime)).map((o,idx)=>{const[bt,bc,bb]=cBadge(o.complexity);
+              return<div key={o.id} className="fade-in" style={{animationDelay:`${idx*25}ms`,background:"#1a1f28",border:"1px solid #252d3a",borderRadius:9,padding:16,borderLeft:`4px solid ${dcol(asgn[o.id])}`}}>
+                <div style={{display:"flex",justifyContent:"space-between",marginBottom:10}}><div><div style={{fontFamily:"'DM Sans',sans-serif",fontWeight:800,fontSize:16,color:"#f0f2f7"}}>{o.company}</div><div style={{fontSize:11,color:"#7b879c",marginTop:2}}>{o.event}</div></div><div style={{textAlign:"right"}}><div style={{fontSize:20,fontWeight:800,color:"#f0f2f7",fontFamily:"'DM Sans',sans-serif"}}>{fmtShort(tm(o.deliveryTime))}</div><div style={{fontSize:10,color:"#7b879c"}}>Serve {fmtShort(tm(o.servingTime))}</div></div></div>
+                <div className="dgrid" style={{marginBottom:10}}><div><div className="dlbl">Guests</div><div className="dval">{o.guests}</div></div><div><div className="dlbl">Setup</div><div className="dval">{o.setupMinutes}min</div></div><div><div className="dlbl">Type</div><div className="badge" style={{background:bb,color:bc}}>{bt}</div></div><div><div className="dlbl">Contact</div><div className="dval">{o.contact}</div></div><div><div className="dlbl">Phone</div><div className="dval">{o.phone}</div></div><div><div className="dlbl">Driver</div><div className="dval" style={{color:dcol(asgn[o.id])}}>{dnam(asgn[o.id])}</div></div><div style={{gridColumn:"1/-1"}}><div className="dlbl">Address</div><div className="dval">{o.address} · {o.room}</div></div></div>
+                <div><div className="dlbl">Menu</div><div className="dval" style={{fontSize:11,lineHeight:1.6}}>{o.menu}</div></div>
+                {o.notes&&<div className="nbox">⚠ {o.notes}</div>}{o.pickup&&<div style={{marginTop:8,background:"#162014",border:"1px solid #244028",borderRadius:5,padding:8,fontSize:11,color:"#86efac"}}>📦 {o.pickup.note}</div>}
+                <div style={{marginTop:8,display:"flex",justifyContent:"space-between",fontSize:9,color:"#566078"}}><span>#{o.id} · {o.salesRep||"—"}</span>{o.masterInvoice&&<span style={{color:"#f59e0b"}}>Master #{o.masterInvoice}</span>}</div>
+              </div>})}
           </div></div>}
 
-          {/* PICKUPS */}
-          {view === "pickups" && <div style={{ flex: 1, overflow: "auto", padding: 20 }}>
-            <div style={{ fontFamily: "'DM Sans',sans-serif", fontWeight: 800, fontSize: 18, color: "#eef1f6", marginBottom: 4 }}>Pickup Route Optimizer</div>
-            <div style={{ fontSize: 12, color: "#5b6b82", marginBottom: 20 }}>Nearest-neighbor TSP routing{apiSt === "ok" ? " · live maps" : ""}</div>
-            {pkRuns.map((run, ri) => <div key={ri} className="pk-run fade-in" style={{ animationDelay: `${ri * 60}ms` }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-                <div><div style={{ fontFamily: "'DM Sans',sans-serif", fontWeight: 700, fontSize: 15, color: "#86efac" }}>Run {ri + 1}: {fmtShort(run.windowStart)} – {fmtShort(run.windowEnd)}</div><div style={{ fontSize: 10, color: "#5b6b82", marginTop: 2 }}>{run.stops.length} stop{run.stops.length > 1 ? "s" : ""}</div></div>
-                <div style={{ textAlign: "right" }}><div style={{ fontSize: 14, color: "#86efac", fontWeight: 700, fontFamily: "'DM Sans',sans-serif" }}>{run.totalTime}min</div></div>
-              </div>
-              <div style={{ paddingLeft: 4 }}>
-                <div className="pk-stop"><div className="pk-num" style={{ background: "#1a1810", color: "#f59e0b" }}>⬤</div><div><div style={{ fontSize: 12, fontWeight: 700, color: "#dde3ec", fontFamily: "'DM Sans',sans-serif" }}>Depart HQ</div></div></div>
-                {run.stops.map((st, si) => { const drv = gCD(dc, si === 0 ? HQ : run.stops[si - 1], st); return <div key={st.id}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 0 4px 10px" }}><div style={{ width: 6, height: 6, borderRadius: 3, background: "#1a3020" }} /><div style={{ fontSize: 9, color: "#5b6b82", fontStyle: "italic" }}>{drv}min →</div></div>
-                  <div className="pk-stop"><div className="pk-num">{si + 1}</div><div style={{ flex: 1 }}><div style={{ display: "flex", justifyContent: "space-between" }}><div><div style={{ fontSize: 12, fontWeight: 700, color: "#dde3ec", fontFamily: "'DM Sans',sans-serif" }}>{st.company}</div><div style={{ fontSize: 10, color: "#5b6b82" }}>{st.address}</div></div><div style={{ textAlign: "right", fontSize: 10, color: "#5b6b82" }}>{st.guests}p</div></div><div style={{ fontSize: 10, color: "#86efac", marginTop: 4 }}>{st.pickup.note}</div></div></div>
-                </div> })}
-                <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 0 4px 10px" }}><div style={{ width: 6, height: 6, borderRadius: 3, background: "#1a3020" }} /><div style={{ fontSize: 9, color: "#5b6b82", fontStyle: "italic" }}>{gCD(dc, run.stops[run.stops.length - 1], HQ)}min →</div></div>
-                <div className="pk-stop" style={{ borderBottom: "none" }}><div className="pk-num" style={{ background: "#1a1810", color: "#f59e0b" }}>⬤</div><div style={{ fontSize: 12, fontWeight: 700, color: "#dde3ec", fontFamily: "'DM Sans',sans-serif" }}>Return to HQ</div></div>
+          {view==="pickups"&&<div style={{flex:1,overflow:"auto",padding:20}}>
+            <div style={{fontFamily:"'DM Sans',sans-serif",fontWeight:800,fontSize:18,color:"#f0f2f7",marginBottom:4}}>Pickup Route Optimizer</div>
+            <div style={{fontSize:12,color:"#7b879c",marginBottom:20}}>TSP routing{apiSt==="ok"?" · live maps":""}</div>
+            {pkRuns.map((run,ri)=><div key={ri} className="pk-run fade-in" style={{animationDelay:`${ri*60}ms`}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}><div><div style={{fontFamily:"'DM Sans',sans-serif",fontWeight:700,fontSize:15,color:"#86efac"}}>Run {ri+1}: {fmtShort(run.windowStart)} – {fmtShort(run.windowEnd)}</div><div style={{fontSize:10,color:"#7b879c",marginTop:2}}>{run.stops.length} stop{run.stops.length>1?"s":""}</div></div><div style={{textAlign:"right"}}><div style={{fontSize:14,color:"#86efac",fontWeight:700,fontFamily:"'DM Sans',sans-serif"}}>{run.totalTime}min</div></div></div>
+              <div style={{paddingLeft:4}}>
+                <div className="pk-stop"><div className="pk-num" style={{background:"#26200f",color:"#f59e0b"}}>⬤</div><div><div style={{fontSize:12,fontWeight:700,color:"#e0e5ee",fontFamily:"'DM Sans',sans-serif"}}>Depart HQ</div></div></div>
+                {run.stops.map((st,si)=>{const drv=gCD(dc,si===0?HQ:run.stops[si-1],st);return<div key={st.id}>
+                  <div style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0 4px 10px"}}><div style={{width:6,height:6,borderRadius:3,background:"#244028"}}/><div style={{fontSize:9,color:"#7b879c",fontStyle:"italic"}}>{drv}min →</div></div>
+                  <div className="pk-stop"><div className="pk-num">{si+1}</div><div style={{flex:1}}><div style={{display:"flex",justifyContent:"space-between"}}><div><div style={{fontSize:12,fontWeight:700,color:"#e0e5ee",fontFamily:"'DM Sans',sans-serif"}}>{st.company}</div><div style={{fontSize:10,color:"#7b879c"}}>{st.address}</div></div><div style={{textAlign:"right",fontSize:10,color:"#7b879c"}}>{st.guests}p</div></div><div style={{fontSize:10,color:"#86efac",marginTop:4}}>{st.pickup.note}</div></div></div>
+                </div>})}
+                <div style={{display:"flex",alignItems:"center",gap:8,padding:"4px 0 4px 10px"}}><div style={{width:6,height:6,borderRadius:3,background:"#244028"}}/><div style={{fontSize:9,color:"#7b879c",fontStyle:"italic"}}>{gCD(dc,run.stops[run.stops.length-1],HQ)}min →</div></div>
+                <div className="pk-stop" style={{borderBottom:"none"}}><div className="pk-num" style={{background:"#26200f",color:"#f59e0b"}}>⬤</div><div style={{fontSize:12,fontWeight:700,color:"#e0e5ee",fontFamily:"'DM Sans',sans-serif"}}>Return to HQ</div></div>
               </div>
               <div className="pk-total"><span>🚐 {run.totalDrive}min</span><span>📦 {run.totalPickupTime}min</span><span>⏱ {run.totalTime}min</span></div>
             </div>)}
-            {allPk.filter(p => p.pickup.type === "server-cleanup").length > 0 && <div style={{ marginTop: 24 }}><div className="stitle">Server Cleanup</div>{allPk.filter(p => p.pickup.type === "server-cleanup").map(p => <div key={p.id} className="pkcard"><div style={{ fontFamily: "'DM Sans',sans-serif", fontWeight: 700, color: "#dde3ec" }}>{p.company}</div><div style={{ fontSize: 10, color: "#5b6b82", marginTop: 2 }}>{p.address}</div><div style={{ fontSize: 11, color: "#93c5fd", marginTop: 6 }}>{p.pickup.note}</div></div>)}</div>}
-            {allPk.filter(p => p.pickup.type === "next-day").length > 0 && <div style={{ marginTop: 24 }}><div className="stitle">Next-Day</div>{allPk.filter(p => p.pickup.type === "next-day").map(p => <div key={p.id} className="pkcard"><div style={{ fontFamily: "'DM Sans',sans-serif", fontWeight: 700, color: "#dde3ec" }}>{p.company}</div><div style={{ fontSize: 10, color: "#5b6b82", marginTop: 2 }}>{p.address}</div><div style={{ fontSize: 11, color: "#f59e0b", marginTop: 6 }}>⏰ {p.pickup.note}</div></div>)}</div>}
+            {allPk.filter(p=>p.pickup.type==="server-cleanup").length>0&&<div style={{marginTop:24}}><div className="stitle">Server Cleanup</div>{allPk.filter(p=>p.pickup.type==="server-cleanup").map(p=><div key={p.id} className="pkcard"><div style={{fontFamily:"'DM Sans',sans-serif",fontWeight:700,color:"#e0e5ee"}}>{p.company}</div><div style={{fontSize:10,color:"#7b879c",marginTop:2}}>{p.address}</div><div style={{fontSize:11,color:"#93c5fd",marginTop:6}}>{p.pickup.note}</div></div>)}</div>}
+            {allPk.filter(p=>p.pickup.type==="next-day").length>0&&<div style={{marginTop:24}}><div className="stitle">Next-Day</div>{allPk.filter(p=>p.pickup.type==="next-day").map(p=><div key={p.id} className="pkcard"><div style={{fontFamily:"'DM Sans',sans-serif",fontWeight:700,color:"#e0e5ee"}}>{p.company}</div><div style={{fontSize:10,color:"#7b879c",marginTop:2}}>{p.address}</div><div style={{fontSize:11,color:"#f59e0b",marginTop:6}}>⏰ {p.pickup.note}</div></div>)}</div>}
           </div>}
 
-          {/* SETTINGS */}
-          {view === "settings" && <div style={{ flex: 1, overflow: "auto", padding: 20, maxWidth: 680 }}>
-            <div style={{ fontFamily: "'DM Sans',sans-serif", fontWeight: 800, fontSize: 18, color: "#eef1f6", marginBottom: 4 }}>Google Maps API</div>
-            <div style={{ fontSize: 12, color: "#5b6b82", marginBottom: 16 }}>Optional: enable Distance Matrix API for live drive times with traffic.</div>
-            <div className="api-bar">
-              <input className="api-input" type="password" placeholder="AIzaSy..." value={apiKey} onChange={e => setApiKey(e.target.value)} />
-              <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-                <button className="api-btn" onClick={fetchMaps} disabled={mapsL}>{mapsL ? "Fetching..." : "Fetch Live Data"}</button>
-                {apiSt === "ok" && <div style={{ fontSize: 10, color: "#86efac" }}>✓ {Object.keys(dc).length} routes</div>}
-                {apiSt === "cors" && <div style={{ fontSize: 10, color: "#f59e0b" }}>CORS — needs proxy</div>}
-                {apiSt === "error" && <div style={{ fontSize: 10, color: "#ef4444" }}>API error</div>}
+          {view==="settings"&&<div style={{flex:1,overflow:"auto",padding:20,maxWidth:680}}>
+            <div style={{fontFamily:"'DM Sans',sans-serif",fontWeight:800,fontSize:18,color:"#f0f2f7",marginBottom:4}}>Google Maps API</div>
+            <div style={{fontSize:12,color:"#7b879c",marginBottom:16}}>Optional: Distance Matrix API for live traffic data.</div>
+            <div className="api-bar"><input className="api-input" type="password" placeholder="AIzaSy..." value={apiKey} onChange={e=>setApiKey(e.target.value)}/>
+              <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}><button className="api-btn" onClick={fetchMaps} disabled={mapsL}>{mapsL?"Fetching...":"Fetch Live Data"}</button>
+                {apiSt==="ok"&&<div style={{fontSize:10,color:"#86efac"}}>✓ {Object.keys(dc).length} routes</div>}
+                {apiSt==="cors"&&<div style={{fontSize:10,color:"#f59e0b"}}>CORS — needs proxy</div>}
+                {apiSt==="error"&&<div style={{fontSize:10,color:"#ef4444"}}>API error</div>}
               </div>
             </div>
           </div>}
